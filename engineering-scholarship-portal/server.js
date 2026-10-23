@@ -45,12 +45,18 @@ const adminLoginLimiter = rateLimit({
 app.use(
   cors({
     origin: function (origin, callback) {
-      // Allow requests with no origin (e.g. curl, Postman, server-to-server)
+      // Allow requests with no origin (e.g. mobile apps, curl, server-to-server)
       if (!origin) return callback(null, true);
-      // Allow any localhost or 127.0.0.1 port in development
-      if (
-        /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)
-      ) {
+      // Allow localhost or 127.0.0.1 on any port in development
+      if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+        return callback(null, true);
+      }
+      // Allow all Vercel deployments (*.vercel.app)
+      if (/^https:\/\/[a-zA-Z0-9_.-]+\.vercel\.app$/.test(origin)) {
+        return callback(null, true);
+      }
+      // Allow custom domain if configured via ALLOWED_ORIGIN
+      if (process.env.ALLOWED_ORIGIN && origin === process.env.ALLOWED_ORIGIN) {
         return callback(null, true);
       }
       callback(new Error("Not allowed by CORS"));
@@ -64,6 +70,30 @@ app.use(express.json());
 
 // Serve static assets from public (e.g. pict-logo.png)
 app.use(express.static(path.join(__dirname, "public")));
+
+// Route normalizer: if a serverless rewrite delivers a URL without "/api", prepend it so all /api/* routes match
+app.use((req, res, next) => {
+  if (!req.url.startsWith("/api") && !req.url.startsWith("/assets") && !req.url.startsWith("/public") && req.url !== "/favicon.ico") {
+    req.url = "/api" + (req.url.startsWith("/") ? req.url : "/" + req.url);
+  }
+  next();
+});
+
+// Database connection middleware for API routes
+app.use(async (req, res, next) => {
+  if (req.url.startsWith("/api")) {
+    try {
+      await connectToDatabase();
+    } catch (err) {
+      console.error("[DB ERROR] Connection failed on request:", err.message);
+      return res.status(503).json({
+        success: false,
+        message: "Database connection failed. Please ensure MONGODB_URI is properly configured.",
+      });
+    }
+  }
+  next();
+});
 
 // ==========================================
 // MONGODB SCHEMAS & MODELS
@@ -762,71 +792,65 @@ function formatMongoUri(rawUri) {
   }
 }
 
-// Connect to MongoDB Atlas with retries, then seed admin and start Express server
-async function startServer() {
-  const uri = formatMongoUri(MONGODB_URI);
-  if (!uri) {
-    console.error("Fatal Error: MONGODB_URI is not set in environment or .env file.");
-    process.exit(1);
+let isConnected = false;
+let dbConnectPromise = null;
+
+// Reusable, serverless-safe MongoDB connection
+async function connectToDatabase() {
+  if (isConnected || mongoose.connection.readyState === 1) {
+    isConnected = true;
+    return;
   }
 
-  const maxRetries = 6;
-  const retryDelay = 2000;
-  let connected = false;
+  if (!dbConnectPromise) {
+    const rawUri = process.env.MONGODB_URI || MONGODB_URI;
+    const uri = formatMongoUri(rawUri);
+    if (!uri) {
+      throw new Error("Fatal Error: MONGODB_URI is not set in environment or .env file.");
+    }
 
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      console.log(`Connecting to MongoDB Atlas (Attempt ${attempt}/${maxRetries})...`);
-      await mongoose.connect(uri, {
-        serverSelectionTimeoutMS: 15000,
-        maxPoolSize: 10,
-      });
-      console.log("MongoDB connected");
-      connected = true;
-      break;
-    } catch (err) {
-      console.error(`MongoDB connection attempt ${attempt} failed: ${err.message}`);
+    dbConnectPromise = (async () => {
+      const maxRetries = 3;
+      const retryDelay = 2000;
 
-      // If SRV lookup fails due to DNS restrictions, try direct replica set connection
-      if (err.message && err.message.includes("querySrv") && uri.includes("cluster0.amrbmel.mongodb.net")) {
-        console.log("SRV lookup restricted. Attempting direct replica-set connection fallback...");
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-          const match = uri.match(/^(mongodb(?:\+srv)?:\/\/)([^:]+):([^@]+)@/);
-          if (match) {
-            const [, , user, pass] = match;
-            const directUri = `mongodb://${user}:${pass}@ac-qgavnds-shard-00-00.amrbmel.mongodb.net:27017,ac-qgavnds-shard-00-01.amrbmel.mongodb.net:27017,ac-qgavnds-shard-00-02.amrbmel.mongodb.net:27017/scholarship_portal?ssl=true&replicaSet=atlas-3fqdxf-shard-0&authSource=admin&retryWrites=true&w=majority`;
-            await mongoose.connect(directUri, {
-              serverSelectionTimeoutMS: 15000,
-              maxPoolSize: 10,
-            });
-            console.log("MongoDB connected successfully via replica-set fallback");
-            connected = true;
-            break;
+          console.log(`Connecting to MongoDB Atlas (Attempt ${attempt}/${maxRetries})...`);
+          await mongoose.connect(uri, {
+            serverSelectionTimeoutMS: 15000,
+            maxPoolSize: 10,
+          });
+          isConnected = true;
+          console.log("MongoDB connected successfully");
+          await seedAdmin();
+          return;
+        } catch (err) {
+          console.error(`MongoDB connection attempt ${attempt} failed: ${err.message}`);
+          if (attempt === maxRetries) {
+            dbConnectPromise = null;
+            isConnected = false;
+            throw err;
           }
-        } catch (directErr) {
-          console.error(`Direct replica-set fallback failed: ${directErr.message}`);
+          await new Promise((resolve) => setTimeout(resolve, retryDelay));
         }
       }
-
-      if (attempt < maxRetries) {
-        console.log(`Retrying MongoDB connection in ${retryDelay / 1000}s...`);
-        await new Promise((resolve) => setTimeout(resolve, retryDelay));
-      } else {
-        console.error("FATAL: All MongoDB connection attempts failed.");
-        console.error("Full error:", err);
-        process.exit(1);
-      }
-    }
+    })();
   }
 
-  if (connected) {
-    // Seed initial admin if needed
-    await seedAdmin();
-
-    app.listen(PORT, () => {
-      console.log(`Engineering Scholarship Finder Backend running on http://localhost:${PORT}`);
-    });
-  }
+  await dbConnectPromise;
 }
 
-startServer();
+// Local development server runner (skipped in Vercel Serverless environment)
+if (!process.env.VERCEL) {
+  connectToDatabase()
+    .then(() => {
+      app.listen(PORT, () => {
+        console.log(`Engineering Scholarship Finder Backend running locally on http://localhost:${PORT}`);
+      });
+    })
+    .catch((err) => {
+      console.error("Local server startup error:", err);
+    });
+}
+
+export default app;

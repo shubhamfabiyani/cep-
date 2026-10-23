@@ -117,7 +117,7 @@ export function AuthPage({ onAuthSuccess, onAdminSuccess, onNavigate, initialRol
     }
 
     setLoading(true);
-    const API_BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:5000";
+    const API_BASE_URL = import.meta.env.VITE_API_URL || "";
     const endpoint = `${API_BASE_URL}${isRegister ? "/api/auth/register" : "/api/auth/login"}`;
 
     try {
@@ -197,7 +197,7 @@ export function AuthPage({ onAuthSuccess, onAdminSuccess, onNavigate, initialRol
     }
 
     setAdminLoading(true);
-    const API_BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:5000";
+    const API_BASE_URL = import.meta.env.VITE_API_URL || "";
     const endpoint = `${API_BASE_URL}/api/admin/login`;
 
     try {
